@@ -187,27 +187,59 @@ object BulkCopyUtils extends Logging {
     private[spark] def getComputedCols(
         conn: Connection, 
         table: String,
+        dfColNames: List[String],
         hideGraphColumns: Boolean): List[String] = {
         // TODO can optimize this, also evaluate SQLi issues
-        val queryStr = if (hideGraphColumns) s"""IF (SERVERPROPERTY('EngineEdition') = 5 OR SERVERPROPERTY('ProductMajorVersion') >= 14)
-exec sp_executesql N'SELECT name
-        FROM sys.computed_columns
-        WHERE object_id = OBJECT_ID(''${table}'')
-        UNION ALL
-        SELECT C.name
-        FROM sys.tables AS T
-        JOIN sys.columns AS C
-        ON T.object_id = C.object_id
-        WHERE T.object_id = OBJECT_ID(''${table}'')
-        AND (T.is_edge = 1 OR T.is_node = 1)
-        AND C.is_hidden = 0
-        AND C.graph_type = 2'
-ELSE
-SELECT name
-        FROM sys.computed_columns
-        WHERE object_id = OBJECT_ID('${table}')
+        var queryStr = s"""
+-- First, enumerate all the computed columns for this table
+declare @sql nvarchar(max)
+SET @sql = 'SELECT name
+FROM sys.computed_columns
+WHERE object_id = OBJECT_ID(''${table}'')
+
+-- then, ignore columns which have defaults associated with them, but only if they are NOT in the input dataframe
+'
+SET @sql = @sql + '
+UNION
+SELECT C.name
+FROM sys.tables AS T
+JOIN sys.columns AS C
+ON T.object_id = C.object_id
+WHERE T.object_id = OBJECT_ID(''${table}'')
+AND C.default_object_id != 0
+AND C.name NOT IN (
+""" + dfColNames.mkString("''", "'',''", "''") + s""")
+'
+-- then, consider the graph ID columns for graph tables if we are on SQL 2017+ or on Azure SQL DB
+IF ('true' = '""" + hideGraphColumns + s"""'
+AND (SERVERPROPERTY('EngineEdition') = 5 OR SERVERPROPERTY('ProductMajorVersion') >= 14))
+SET @sql = @sql + '
+UNION
+SELECT C.name
+FROM sys.tables AS T
+JOIN sys.columns AS C
+ON T.object_id = C.object_id
+WHERE T.object_id = OBJECT_ID(''${table}'')
+AND (T.is_edge = 1 OR T.is_node = 1)
+AND C.is_hidden = 0
+AND C.graph_type = 2
+'
+
+-- consider system-generated columns for temporal tables if we are on SQL 2016+ or on Azure SQL DB
+IF (SERVERPROPERTY('EngineEdition') = 5 OR SERVERPROPERTY('ProductMajorVersion') >= 13)
+SET @sql = @sql + '
+UNION
+SELECT C.name
+FROM sys.tables AS T
+JOIN sys.columns AS C
+ON T.object_id = C.object_id
+WHERE T.object_id = OBJECT_ID(''${table}'')
+AND T.temporal_type != 0
+AND C.generated_always_type != 0
+'
+
+exec sp_executesql @sql        
         """
-        else s"SELECT name FROM sys.computed_columns WHERE object_id = OBJECT_ID('${table}');"
 
         val computedColRs = conn.createStatement.executeQuery(queryStr)
         val computedCols = ListBuffer[String]()
@@ -325,8 +357,9 @@ SELECT name
           zip df.schema.fieldNames.toList).toMap
         val dfCols = df.schema
 
+        val dfColNames =  df.schema.fieldNames.toList
         val tableCols = getSchema(rs, JdbcDialects.get(url))
-        val computedCols = getComputedCols(conn, dbtable, hideGraphColumns)
+        val computedCols = getComputedCols(conn, dbtable, dfColNames, hideGraphColumns)
 
         val prefix = "Spark Dataframe and SQL Server table have differing"
 
@@ -334,7 +367,6 @@ SELECT name
             assertIfCheckEnabled(dfCols.length == tableCols.length, strictSchemaCheck,
                 s"${prefix} numbers of columns")
         } else if (strictSchemaCheck) {
-            val dfColNames =  df.schema.fieldNames.toList
             val dfComputedColCt = dfComputedColCount(dfColNames, computedCols, dfColCaseMap, isCaseSensitive)
             // if df has computed column(s), check column length using non computed column in df and table.
             // non computed column number in df: dfCols.length - dfComputedColCt
